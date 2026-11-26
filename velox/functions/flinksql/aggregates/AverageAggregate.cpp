@@ -16,6 +16,7 @@
 #include "velox/functions/flinksql/aggregates/AverageAggregate.h"
 
 #include "velox/common/base/CheckedArithmetic.h"
+#include "velox/experimental/stateful/agg/RetractableAggregate.h"
 #include "velox/functions/lib/aggregates/AverageAggregateBase.h"
 #include "velox/functions/lib/aggregates/DecimalAggregate.h"
 #include "velox/type/DecimalUtil.h"
@@ -25,17 +26,26 @@ using namespace facebook::velox::functions::aggregate;
 namespace facebook::velox::aggregate::flinksql {
 namespace {
 
-/// Average over integral inputs with Flink semantics: the sum accumulates in
-/// BIGINT with wrap-around addition (uint64_t produces the same bit pattern
-/// as Java's long addition without signed-overflow UB), and the final value
-/// is a truncating integer division, e.g. avg(7, 2) over BIGINT is 3.
-template <typename TInput, typename TResult>
+/// Average with retraction support built in, registered under the SQL name
+/// so accumulate-only and retracting plans resolve to the same function.
+/// Semantics follow Flink's AvgAggFunction: integral sums accumulate in
+/// BIGINT with wrap-around addition and subtraction (uint64_t produces the
+/// same bit pattern as Java's long arithmetic without signed-overflow UB),
+/// integral results use truncating division, REAL results round the double
+/// quotient, and the final value depends on the count alone - a count of
+/// zero is an empty aggregate and reads as null however it was reached
+/// (accumulation never saw input, or retraction took every row back).
+/// Retraction subtracts the value from the sum and one from the count and
+/// does not stop at zero: an over-retracted group keeps its negative count,
+/// matching Flink, which does not guard the running values.
+template <typename TInput, typename TResult, typename TAccumulator = uint64_t>
 class AverageAggregate
-    : public AverageAggregateBase<TInput, uint64_t, TResult> {
+    : public AverageAggregateBase<TInput, TAccumulator, TResult>,
+      public stateful::RetractableAggregate {
  public:
-  explicit AverageAggregate(TypePtr resultType)
-      : AverageAggregateBase<TInput, uint64_t, TResult>(std::move(resultType)) {
-  }
+  using Base = AverageAggregateBase<TInput, TAccumulator, TResult>;
+
+  explicit AverageAggregate(TypePtr resultType) : Base(std::move(resultType)) {}
 
   // The base's extractAccumulators casts the intermediate sum column to
   // FlatVector<TAccumulator>, but a BIGINT column is a FlatVector<int64_t>,
@@ -44,27 +54,31 @@ class AverageAggregate
   // int64_t and cast bit-preservingly.
   void extractAccumulators(char** groups, int32_t numGroups, VectorPtr* result)
       override {
-    auto rowVector = (*result)->as<RowVector>();
-    auto sumVector = rowVector->childAt(0)->asFlatVector<int64_t>();
-    auto countVector = rowVector->childAt(1)->asFlatVector<int64_t>();
+    if constexpr (std::is_same_v<TAccumulator, uint64_t>) {
+      auto rowVector = (*result)->as<RowVector>();
+      auto sumVector = rowVector->childAt(0)->asFlatVector<int64_t>();
+      auto countVector = rowVector->childAt(1)->asFlatVector<int64_t>();
 
-    rowVector->resize(numGroups);
-    sumVector->resize(numGroups);
-    countVector->resize(numGroups);
-    uint64_t* rawNulls = this->getRawNulls(rowVector);
+      rowVector->resize(numGroups);
+      sumVector->resize(numGroups);
+      countVector->resize(numGroups);
+      uint64_t* rawNulls = this->getRawNulls(rowVector);
 
-    int64_t* rawCounts = countVector->mutableRawValues();
-    int64_t* rawSums = sumVector->mutableRawValues();
-    for (auto i = 0; i < numGroups; ++i) {
-      char* group = groups[i];
-      if (this->isNull(group)) {
-        rowVector->setNull(i, true);
-      } else {
-        this->clearNull(rawNulls, i);
-        auto* sumCount = this->accumulator(group);
-        rawCounts[i] = sumCount->count;
-        rawSums[i] = static_cast<int64_t>(sumCount->sum);
+      int64_t* rawCounts = countVector->mutableRawValues();
+      int64_t* rawSums = sumVector->mutableRawValues();
+      for (auto i = 0; i < numGroups; ++i) {
+        char* group = groups[i];
+        if (this->isNull(group)) {
+          rowVector->setNull(i, true);
+        } else {
+          this->clearNull(rawNulls, i);
+          auto* sumCount = this->accumulator(group);
+          rawCounts[i] = sumCount->count;
+          rawSums[i] = static_cast<int64_t>(sumCount->sum);
+        }
       }
+    } else {
+      Base::extractAccumulators(groups, numGroups, result);
     }
   }
 
@@ -81,32 +95,99 @@ class AverageAggregate
       if (this->isNull(group)) {
         vector->setNull(i, true);
       } else {
-        this->clearNull(rawNulls, i);
         auto* sumCount = this->accumulator(group);
-        rawValues[i] = static_cast<TResult>(
-            static_cast<int64_t>(sumCount->sum) / sumCount->count);
+        if (sumCount->count == 0) {
+          vector->setNull(i, true);
+        } else {
+          this->clearNull(rawNulls, i);
+          if constexpr (std::is_integral_v<TResult>) {
+            rawValues[i] = static_cast<TResult>(
+                static_cast<int64_t>(sumCount->sum) / sumCount->count);
+          } else {
+            rawValues[i] =
+                static_cast<TResult>(sumCount->sum / sumCount->count);
+          }
+        }
       }
     }
+  }
+
+  // Retraction mirrors the base's non-null accumulation: subtract the
+  // argument from the sum and one from the count. The null filter matches
+  // accumulation (null arguments never contributed), unsigned sums wrap
+  // around like Java's long subtraction, and the count may go negative on
+  // over-retraction.
+  void retractRawInput(
+      char** groups,
+      const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args,
+      bool /*mayPushdown*/) override {
+    Base::decodedRaw_.decode(*args[0], rows);
+    rows.applyToSelected([&](vector_size_t i) {
+      if (Base::decodedRaw_.isNullAt(i)) {
+        return;
+      }
+      auto* sumCount = Base::accumulator(groups[i]);
+      sumCount->sum -= static_cast<TAccumulator>(
+          Base::decodedRaw_.template valueAt<TInput>(i));
+      sumCount->count -= 1;
+    });
   }
 };
 
 /// Average over DECIMAL(p, s) with Flink semantics: the sum stays at the
 /// input scale while the result type is DECIMAL(38, max(6, s)), so the final
 /// division rescales the fraction by 10^k, k = max(6, s) - s, with HALF_UP
-/// rounding, matching Flink's decimal division.
+/// rounding, matching Flink's decimal division. Retraction runs the negated
+/// input through the same carry-tracking addition the accumulator uses: the
+/// stored pair (overflow, sum) represents overflow * 2^127 + sum, so a
+/// subtract carries or borrows through the overflow word symmetric to an
+/// add, and the value follows the count alone like the fixed-width average.
 template <typename TInput>
-class DecimalAverageAggregate : public DecimalAggregate<int128_t, TInput> {
+class DecimalAverageAggregate : public DecimalAggregate<int128_t, TInput>,
+                                public stateful::RetractableAggregate {
  public:
-  explicit DecimalAverageAggregate(TypePtr resultType, uint8_t resultRescale)
-      : DecimalAggregate<int128_t, TInput>(std::move(resultType)),
-        resultRescale_(resultRescale) {}
+  using Base = DecimalAggregate<int128_t, TInput>;
+  using Acc = functions::aggregate::LongDecimalWithOverflowState;
 
-  int128_t computeFinalValue(functions::aggregate::LongDecimalWithOverflowState*
-                                 accumulator) override {
+  explicit DecimalAverageAggregate(TypePtr resultType, uint8_t resultRescale)
+      : Base(std::move(resultType)), resultRescale_(resultRescale) {}
+
+  // The base loop reads a final value for every non-null group, but a count
+  // of zero is an empty aggregate and reads as null however it was reached,
+  // so the zero-count check lives here; computeFinalValue cannot express
+  // null.
+  void extractValues(char** groups, int32_t numGroups, VectorPtr* result)
+      override {
+    auto vector = (*result)->as<FlatVector<int128_t>>();
+    VELOX_CHECK(vector);
+    vector->resize(numGroups);
+    uint64_t* rawNulls = this->getRawNulls(vector);
+
+    int128_t* rawValues = vector->mutableRawValues();
+    for (int32_t i = 0; i < numGroups; ++i) {
+      char* group = groups[i];
+      if (this->isNull(group)) {
+        vector->setNull(i, true);
+      } else {
+        auto* sumCount = exec::Aggregate::value<Acc>(group);
+        if (sumCount->count == 0) {
+          vector->setNull(i, true);
+        } else {
+          this->clearNull(rawNulls, i);
+          rawValues[i] = computeFinalValue(sumCount);
+        }
+      }
+    }
+  }
+
+  // 'accumulator->count' is never zero: extractValues reads null for a
+  // zero count. A negative count (over-retraction) flows through the
+  // divisions, reading back the retracted input like the fixed-width
+  // average.
+  int128_t computeFinalValue(Acc* accumulator) override {
     const int128_t sum = accumulator->sum;
     const int64_t count = accumulator->count;
-    VELOX_USER_CHECK_GT(
-        count, 0, "Cannot produce the final value of avg without any input");
 
     // Decompose trueSum = overflow * 2^127 + sum (see
     // DecimalUtil::addWithOverflow) into quotient and remainder over count.
@@ -151,6 +232,31 @@ class DecimalAverageAggregate : public DecimalAggregate<int128_t, TInput> {
                quotient + extraQuotient,
                DecimalUtil::kPowersOfTen[resultRescale_]) +
         scaledRemainder;
+  }
+
+  // Retraction mirrors updateNonNullValue: the negated input runs through
+  // the same addWithOverflow, whose carry lands in the overflow word in
+  // either direction (a borrow is a carry of -1). DECIMAL(38) values fit
+  // the 127-bit magnitude, so the negation is always exact. The null filter
+  // matches accumulation, and the count may go negative on over-retraction.
+  void retractRawInput(
+      char** groups,
+      const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args,
+      bool /*mayPushdown*/) override {
+    DecodedVector decoded;
+    decoded.decode(*args[0], rows);
+    rows.applyToSelected([&](vector_size_t i) {
+      if (decoded.isNullAt(i)) {
+        return;
+      }
+      auto* accumulator = exec::Aggregate::value<Acc>(groups[i]);
+      const int128_t negated =
+          -static_cast<int128_t>(decoded.valueAt<TInput>(i));
+      accumulator->overflow += DecimalUtil::addWithOverflow(
+          accumulator->sum, negated, accumulator->sum);
+      accumulator->count -= 1;
+    });
   }
 
  private:
@@ -255,12 +361,11 @@ void registerAverageAggregate(
               VELOX_NYI();
             }
             case TypeKind::REAL:
-              return std::
-                  make_unique<AverageAggregateBase<float, double, float>>(
-                      resultType);
+              return std::make_unique<AverageAggregate<float, float, double>>(
+                  resultType);
             case TypeKind::DOUBLE:
-              return std::make_unique<
-                  AverageAggregateBase<double, double, double>>(resultType);
+              return std::make_unique<AverageAggregate<double, double, double>>(
+                  resultType);
             default:
               VELOX_FAIL(
                   "Unknown input type for {} aggregation {}",

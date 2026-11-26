@@ -11,10 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-velox_add_library(
-  velox_functions_flink_aggregates
-  AverageAggregate.cpp
-  RegisterAggregateFunctions.cpp)
+velox_add_library(velox_functions_flink_aggregates AverageAggregate.cpp
+                  CountAggregate.cpp RegisterAggregateFunctions.cpp)
 
 velox_link_libraries(
   velox_functions_flink_aggregates
@@ -22,3 +20,7 @@ velox_link_libraries(
   velox_exec
   velox_aggregates
   velox_vector)
+
+if(${VELOX_BUILD_TESTING})
+  add_subdirectory(tests)
+endif()

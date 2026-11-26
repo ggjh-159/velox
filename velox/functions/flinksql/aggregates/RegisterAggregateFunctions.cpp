@@ -16,6 +16,7 @@
 #include "velox/functions/flinksql/aggregates/RegisterAggregateFunctions.h"
 
 #include "velox/functions/flinksql/aggregates/AverageAggregate.h"
+#include "velox/functions/flinksql/aggregates/CountAggregate.h"
 
 namespace facebook::velox::aggregate::flinksql {
 
@@ -24,6 +25,7 @@ void registerAggregateFunctions(
     bool withCompanionFunctions,
     bool overwrite) {
   registerAverageAggregate(prefix, withCompanionFunctions, overwrite);
+  registerCountAggregate(prefix, withCompanionFunctions, overwrite);
 }
 
 } // namespace facebook::velox::aggregate::flinksql
